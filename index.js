@@ -38,7 +38,7 @@ function hiddenChannelModel() {
             const parent = byId.get(parentId);
             hidden.push({
                 id: String(channel.id), guildId: String(guildId), type: Number(channel.type),
-                typeName: types[channel.type], name: text(channel.name) || "Unnamed channel",
+                typeName: types[channel.type], name: text(channel.name) || "Name unavailable",
                 topic: text(channel.topic, 6000), parentId,
                 category: Number(channel.type) === 4 ? "Categories" : (parent ? text(parent.name) : (parentId ? "Category " + parentId : "Uncategorized")),
                 categoryPosition: Number(channel.type) === 4 ? -2 : (parent ? position(parent.position) : -1),
@@ -69,39 +69,110 @@ function hiddenChannelModel() {
             return { id, label: Number(rule.type) === 1 ? "Member " + id : (id === String(guildId) ? "@everyone" : text(roleMap[id]?.name) || "Role " + id), value: allow && deny ? "Conflicting rules" : allow ? "Allow view" : "Deny view" };
         }).filter(Boolean);
     }
-    return { channelsFrom, catalog, rules };
+    function voiceParticipants(input, channelId, guildId, getUser, getMember) {
+        if (!input || typeof input !== "object") return { available: false, people: [], truncated: false };
+        const values = Object.prototype.toString.call(input) === "[object Map]" ? Array.from(input.values()) : Object.values(input);
+        const people = [], seen = new Set();
+        for (const raw of values.slice(0, 2000)) {
+            if (!raw || typeof raw !== "object") continue;
+            const state = raw.voiceState || raw;
+            if (String(state.channelId ?? state.channel_id ?? "") !== String(channelId)) continue;
+            if (state.guildId || state.guild_id) {
+                if (String(state.guildId || state.guild_id) !== String(guildId)) continue;
+            }
+            const id = String(state.userId || state.user_id || "");
+            if (!id || seen.has(id)) continue;
+            seen.add(id);
+            let user, member;
+            try { user = getUser?.(id); } catch (_) {}
+            try { member = getMember?.(guildId, id); } catch (_) {}
+            const flags = [];
+            if (state.mute === true) flags.push("Server muted");
+            else if (state.selfMute === true || state.self_mute === true) flags.push("Muted");
+            if (state.deaf === true) flags.push("Server deafened");
+            else if (state.selfDeaf === true || state.self_deaf === true) flags.push("Deafened");
+            if (state.selfVideo === true || state.self_video === true) flags.push("Camera on");
+            if (state.selfStream === true || state.self_stream === true) flags.push("Streaming");
+            if (state.suppress === true) flags.push("Audience");
+            people.push({ id, name: text(member?.nick) || text(user?.globalName) || text(user?.global_name) || text(user?.username) || "User " + id, flags });
+        }
+        people.sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id));
+        return { available: true, people: people.slice(0, 200), truncated: people.length > 200 || values.length > 2000 };
+    }
+    return { channelsFrom, catalog, rules, voiceParticipants };
 }
 
 
-/* Add our own metadata rows only to a recognized server list's footer. */
-function attachHiddenFooter(React, tree, Section, guildId) {
-    let count = 0;
-    function visit(node, depth) {
-        if (!node || depth > 12) return node;
-        if (Array.isArray(node)) {
-            const result = node.map(child => visit(child, depth + 1));
-            return result.some((child, i) => child !== node[i]) ? result : node;
-        }
-        if (!React.isValidElement(node)) return node;
-        const props = node.props || {};
-        if (typeof props.renderItem === "function" && (Array.isArray(props.data) || Array.isArray(props.sections))) {
-            const Previous = props.ListFooterComponent;
-            if (Previous?.__hiddenChannelsFooter) return node;
-            function HiddenChannelsFooter(footerProps) {
-                const previous = React.isValidElement(Previous) ? Previous : Previous ? React.createElement(Previous, footerProps) : null;
-                return React.createElement(React.Fragment, null, previous, React.createElement(Section, { guildId }));
-            }
-            HiddenChannelsFooter.__hiddenChannelsFooter = true;
-            count++;
-            return React.cloneElement(node, { ListFooterComponent: HiddenChannelsFooter });
-        }
-        if (props.children) {
-            const children = visit(props.children, depth + 1);
-            if (children !== props.children) return React.cloneElement(node, { children });
-        }
-        return node;
+/* Discord Android 349.9 ChannelListImpl projection. No permission override.
+ * Clone display models, preserving their prototypes and the original stores.
+ * The native renderer is intercepted before any hidden channel component runs.
+ */
+function projectHiddenChannels(original, hidden, getRecord) {
+    if (!original || !original.categories || !original.noParentCategory
+        || typeof original.getRows !== "function" || typeof original.getSections !== "function"
+        || typeof original.getChannelFromSectionRow !== "function") return null;
+    const clone = value => Object.assign(Object.create(Object.getPrototypeOf(value)), value);
+    const projected = clone(original), byParent = new Map();
+    const supported = new Set([0, 2, 5, 13, 15, 16]);
+    for (const channel of hidden) {
+        if (!supported.has(channel.type)) continue;
+        const parent = channel.parentId && original.categories[channel.parentId] ? channel.parentId : "";
+        if (!byParent.has(parent)) byParent.set(parent, []);
+        byParent.get(parent).push(channel);
     }
-    return { tree: visit(tree, 0), count };
+    function copyCategory(category, additions = []) {
+        if (!category || typeof category.getShownChannelIds !== "function" || !category.channels) return category;
+        const copy = clone(category);
+        copy.guild = projected;
+        copy.channels = {};
+        for (const [id, row] of Object.entries(category.channels)) {
+            copy.channels[id] = clone(row);
+            copy.channels[id].category = copy;
+        }
+        const nativeIds = category.getShownChannelIds().slice();
+        const extra = [];
+        for (const channel of additions) {
+            const record = getRecord(channel.id);
+            if (!record || String(record.guild_id || record.guildId) !== String(original.id)) continue;
+            const row = copy.channels[channel.id] || { id: channel.id, record, category: copy, position: 0 };
+            // Only our renderer consumes these added rows; native voice/text components never mount.
+            Object.assign(row, { record, threadIds: [], threadCount: 0, subtitle: null, __hiddenChannelsRow: true });
+            copy.channels[channel.id] = row;
+            extra.push(channel.id);
+        }
+        const order = id => {
+            const record = copy.channels[id]?.record || {};
+            return (Number(record.position) || 0) + ([2, 13].includes(Number(record.type)) ? 10000 : 0);
+        };
+        const shown = copy.isCollapsed ? nativeIds : [...new Set([...nativeIds, ...extra])].sort((a, b) => order(a) - order(b));
+        copy.shownChannelIds = shown;
+        copy.getShownChannelIds = () => shown;
+        return copy;
+    }
+    projected.categories = {};
+    for (const [id, category] of Object.entries(original.categories)) projected.categories[id] = copyCategory(category, byParent.get(id));
+    projected.noParentCategory = copyCategory(original.noParentCategory, byParent.get(""));
+    // Clone every category touched by native layout so native position caches stay isolated.
+    for (const key of ["favoritesCategory", "recentsCategory", "voiceChannelsCategory"]) projected[key] = copyCategory(original[key]);
+    projected.rows = null;
+    projected.sections = null;
+    projected.sortedNamedCategories = null;
+    projected.allChannelsById = null;
+    projected.firstVoiceChannel = undefined;
+    // Keep Discord's quick-join candidate exactly as it was before this display change.
+    if (typeof original.getFirstVoiceChannel === "function") projected.getFirstVoiceChannel = original.getFirstVoiceChannel.bind(original);
+    projected.__hiddenChannelsProjection = true;
+    // Verify the model before exposing it to native list code.
+    const sections = projected.getSections();
+    if (!Array.isArray(sections) || sections.some(n => !Number.isInteger(n) || n < 0)) return null;
+    return projected;
+}
+
+function hiddenVoiceLayout(voice, fontScale = 1) {
+    const scale = Math.max(1, Math.min(3, Number(fontScale) || 1));
+    const count = voice?.people?.length || 0;
+    const row = 30 * scale, header = 44 * scale, note = 26 * scale;
+    return { scale, row, header, note, height: header + (voice ? Math.min(count, 10) * row + (!count || count > 10 ? note : 0) : 0) };
 }
 
 
@@ -132,6 +203,16 @@ function createHiddenUI(api, runtime) {
             text(channel.typeName + " · " + channel.category, s.muted),
             channel.topic ? text(channel.topic, [s.muted, { marginTop: 5 }], { numberOfLines: 2 }) : null);
     }
+    function VoiceDetails({ voice }) {
+        if (!voice) return null;
+        return h(RN.View, { style: s.card },
+            text("Voice participants", { fontWeight: "700" }),
+            text("Only participants and status received by this client are shown.", s.muted),
+            voice.people.length ? voice.people.map(person => h(RN.View, { key: person.id, style: { marginTop: 10 } },
+                text(person.name), person.flags.length ? text(person.flags.join(" · "), s.muted) : null))
+                : text(voice.available ? "No participants are present in the received data. This does not confirm that the call is empty." : "Participant data is unavailable on this build.", [s.muted, { marginTop: 8 }]),
+            voice.truncated ? text("Showing a limited participant list.", s.muted) : null);
+    }
     function Details({ guildId, id, onBack }) {
         const d = runtime.detail(guildId, id);
         if (d.issue) return h(RN.View, null, button("Back to channels", onBack), text(d.issue, s.muted));
@@ -148,11 +229,12 @@ function createHiddenUI(api, runtime) {
                 d.slowmode ? text("Slowmode: " + d.slowmode + " seconds", s.muted) : null,
                 d.bitrate ? text("Bitrate: " + Math.round(d.bitrate / 1000) + " kbps", s.muted) : null,
                 d.userLimit ? text("Voice user limit: " + d.userLimit, s.muted) : null),
+            h(VoiceDetails, { voice: d.voice }),
             h(RN.View, { style: s.card }, text("View permission rules", { fontWeight: "700" }),
                 text("Cached channel rules, not a complete list of people who can access it.", s.muted),
                 d.rules.length ? d.rules.map((rule, i) => text(rule.label + " · " + rule.value, { marginTop: 8 }, { key: rule.id + ":" + i }))
                     : text("No explicit view rules are available in the cached metadata.", [s.muted, { marginTop: 8 }])),
-            text("Messages and voice are not accessible through this viewer.", [s.muted, { marginTop: 14 }])
+            text("Hidden messages and call audio cannot be accessed.", [s.muted, { marginTop: 14 }])
         );
     }
     function Viewer({ guildId, showSettings = false } = {}) {
@@ -170,10 +252,10 @@ function createHiddenUI(api, runtime) {
             text("Hidden channels", s.title),
             text("Names and details already received by your Discord client. Hidden messages cannot be read.", s.muted),
             showSettings ? h(RN.View, { style: s.card },
-                text("Version " + (api.plugin.manifest?.version || "0.1.0") + " · Classic beta", s.muted),
+                text("Version " + (api.plugin.manifest?.version || "0.2.0") + " · Classic beta", s.muted),
                 h(RN.View, { style: s.row }, h(RN.View, { style: { flex: 1, paddingRight: 10 } },
-                    text("Show locked section in server list"), text("Requires a compatible mobile list layout.", s.muted)),
-                    h(RN.Switch, { value: runtime.inlineEnabled(), onValueChange: runtime.setInline, accessibilityLabel: "Show locked section in server list" })),
+                    text("Show hidden channels in normal categories"), text("Real names with a lock; voice participants when available.", s.muted)),
+                    h(RN.Switch, { value: runtime.inlineEnabled(), onValueChange: runtime.setInline, accessibilityLabel: "Show hidden channels in normal categories" })),
                 text(runtime.status(), s.muted)) : null,
             button(data.guild ? data.guild.name + " · Change server" : "Choose a server", () => { setChoosing(!choosing); setSelected(""); }),
             choosing ? h(RN.View, null,
@@ -189,16 +271,25 @@ function createHiddenUI(api, runtime) {
                 filtered.length > limit ? button("Show more", () => setLimit(limit + 50)) : null)
         );
     }
-    function InlineSection({ guildId }) {
+    function LockedRow({ guildId, id }) {
         useRefresh();
-        const data = runtime.snapshot(guildId), enabled = runtime.inlineEnabled();
-        React.useEffect(() => { if (enabled && data.hidden.length) runtime.markInlineMounted(); }, [enabled, data.hidden.length]);
-        if (!enabled || !data.guild || !data.hidden.length) return null;
-        return h(RN.View, { style: s.inline },
-            text("🔒 Hidden channels · " + data.hidden.length, { fontWeight: "700" }),
-            text("Channel details only", s.muted),
-            data.hidden.slice(0, 20).map(channel => channelRow(channel, () => runtime.showDetail(guildId, channel.id))),
-            button("Browse and search hidden channels", () => runtime.openViewer(guildId)));
+        const enabled = runtime.inlineEnabled(), channel = runtime.row(guildId, id);
+        React.useEffect(() => { if (enabled && channel) runtime.markInlineMounted(); }, [enabled, id]);
+        if (!enabled || !channel) return null;
+        const layout = hiddenVoiceLayout(channel.voice, RN.PixelRatio?.getFontScale?.() || 1);
+        const people = channel.voice?.people || [];
+        const label = "🔒 " + channel.name;
+        return h(RN.TouchableOpacity, {
+            style: { height: layout.height, paddingHorizontal: 16, overflow: "hidden" },
+            accessibilityRole: "button", accessibilityLabel: label + ". Open channel details",
+            onPress: () => runtime.showDetail(guildId, id)
+        },
+        h(RN.View, { style: { height: layout.header, justifyContent: "center" } },
+            text(label, { color: c.muted, fontSize: 16 * layout.scale, lineHeight: 22 * layout.scale, fontWeight: "600" }, { numberOfLines: 1, allowFontScaling: false })),
+        people.slice(0, 10).map(person => h(RN.View, { key: person.id, style: { height: layout.row, paddingLeft: 22, justifyContent: "center" } },
+            text(person.name + (person.flags.length ? " · " + person.flags.join(" · ") : ""), { color: c.muted, fontSize: 12 * layout.scale, lineHeight: 18 * layout.scale }, { numberOfLines: 1, allowFontScaling: false }))),
+        channel.voice && (!people.length || people.length > 10) ? h(RN.View, { style: { height: layout.note, paddingLeft: 22, justifyContent: "center" } },
+            text(people.length > 10 ? "+ " + (people.length - 10) + " more · tap for details" : "Participant data unavailable or empty", { color: c.muted, fontSize: 11 * layout.scale, lineHeight: 16 * layout.scale }, { numberOfLines: 1, allowFontScaling: false })) : null);
     }
     function Modal({ guildId, onClose }) {
         const size = RN.Dimensions?.get?.("window") || { width: 360, height: 720 };
@@ -212,7 +303,7 @@ function createHiddenUI(api, runtime) {
     return {
         Settings: () => guarded(Viewer, { showSettings: true }),
         Modal: props => guarded(Modal, props),
-        InlineSection: props => guarded(InlineSection, props)
+        LockedRow: props => guarded(LockedRow, props)
     };
 }
 
@@ -221,17 +312,29 @@ function createHiddenPlugin(api) {
     const common = api.metro.common, React = common.React, RN = common.ReactNative;
     const model = hiddenChannelModel(), storage = api.plugin.storage || {};
     const disposers = [], subscribers = new Set();
-    let active = false, loggedOut = false, channelStore, guildStore, permissionStore, userStore, selectedGuildStore;
+    let active = false, loggedOut = false, channelStore, guildStore, permissionStore, userStore, selectedGuildStore, voiceStore, memberStore, listStore;
     let permissionCheck, viewPermission, ui, modalOpen = false, inlineMounted = false;
     let hookNames = [], lastIssue = "", reading = false;
     let showInline = storage.showInline !== false;
+    let revision = 0, refreshTimer, inlineReady = false;
+    const projections = new Map();
     function find(method, ...args) { try { return api.metro[method]?.(...args); } catch (_) {} }
     function store(name, ...props) { return find("findByStoreName", name) || find("findByProps", ...props); }
     function report(message) {
         lastIssue = message;
         try { api.logger?.warn?.("Hidden Channels: " + message); } catch (_) {}
     }
-    function notify() { subscribers.forEach(fn => { try { fn(); } catch (_) {} }); }
+    function notify() {
+        revision++; projections.clear();
+        subscribers.forEach(fn => { try { fn(); } catch (_) {} });
+    }
+    function refreshList() {
+        if (refreshTimer != null) return;
+        refreshTimer = setTimeout(() => {
+            refreshTimer = undefined;
+            try { listStore?.emitChange?.(); } catch (_) {}
+        }, 32);
+    }
     function guilds() {
         try {
             if (!active || loggedOut || !userStore?.getCurrentUser?.()?.id) return [];
@@ -243,6 +346,21 @@ function createHiddenPlugin(api) {
     }
     function currentGuild() { try { return String(selectedGuildStore?.getGuildId?.() || ""); } catch (_) { return ""; } }
     function getChannel(id) { try { return channelStore?.getChannel?.(id); } catch (_) {} }
+    function isHidden(channel) {
+        try {
+            if (!active || loggedOut || !channel || !userStore?.getCurrentUser?.()?.id) return false;
+            const id = String(channel.guild_id || channel.guildId || ""), joined = guildStore?.getGuilds?.();
+            const present = Object.prototype.toString.call(joined) === "[object Map]" ? joined.has(id) : joined && Object.prototype.hasOwnProperty.call(joined, id);
+            return !!present && viewPermission !== undefined && permissionCheck?.call(permissionStore, viewPermission, channel) === false;
+        } catch (_) { return false; }
+    }
+    function voice(guildId, id) {
+        const channel = getChannel(id);
+        if (!isHidden(channel) || String(channel.guild_id || channel.guildId) !== String(guildId) || ![2, 13].includes(Number(channel.type))) return null;
+        let states;
+        try { states = voiceStore?.getVoiceStatesForChannel?.(id); } catch (_) {}
+        return model.voiceParticipants(states, id, guildId, id => userStore?.getUser?.(id), (guild, id) => memberStore?.getMember?.(guild, id));
+    }
     function rawChannels(guildId) {
         const sources = [], failures = [];
         const read = (method, ...args) => {
@@ -250,7 +368,7 @@ function createHiddenPlugin(api) {
             try { sources.push(channelStore[method](...args)); } catch (_) { failures.push(method); }
         };
         read("getMutableGuildChannelsForGuild", guildId);
-        read("getChannels");
+        if (!model.channelsFrom(sources, guildId).records.length) read("getChannels");
         if (!model.channelsFrom(sources, guildId).records.length) read("getChannels", guildId);
         if (!model.channelsFrom(sources, guildId).records.length) read("getAllChannels");
         if (!sources.length) return { sources, error: failures.length ? "The channel metadata getter failed on this build." : "No supported cached-channel getter was found." };
@@ -282,16 +400,17 @@ function createHiddenPlugin(api) {
         if (!channel) return { issue: "This channel is no longer in the cached hidden-channel list." };
         let roles = {};
         try { roles = guildStore?.getGuild?.(guildId)?.roles || {}; } catch (_) {}
-        return { ...channel, guildName: data.guild.name, rules: model.rules(getChannel(id), roles, guildId) };
+        return { ...channel, guildName: data.guild.name, rules: model.rules(getChannel(id), roles, guildId), voice: voice(guildId, id) };
     }
     function showDetail(guildId, id) {
         const d = detail(guildId, id);
         RN.Alert.alert(d.issue ? "Hidden Channels" : "🔒 " + d.name, d.issue || [
             d.typeName + " · " + d.category,
             d.topic || "No topic is available in the cached metadata.",
+            d.voice ? (d.voice.people.length ? "Voice participants received by this client:\n" + d.voice.people.map(p => p.name + (p.flags.length ? " · " + p.flags.join(", ") : "")).join("\n") : "Participant data is unavailable or empty; this does not confirm the call is empty.") : "",
             "Channel ID: " + d.id,
-            "Messages and voice are not accessible through this viewer."
-        ].join("\n\n"));
+            "Hidden messages and call audio cannot be accessed."
+        ].filter(Boolean).join("\n\n"));
     }
     function fallback(guildId) {
         const data = snapshot(guildId);
@@ -315,34 +434,77 @@ function createHiddenPlugin(api) {
         } catch (_) { modalOpen = false; fallback(guildId); }
     }
     function installInline() {
-        const seen = new Set();
-        for (const name of ["GuildChannels", "GuildChannelList", "GuildChannelsList", "ChannelList", "ChannelListConnected"]) {
-            const module = find("findByName", name, false) || find("findByDisplayName", name, false);
-            if (!module || seen.has(module)) continue;
-            const key = typeof module.default === "function" ? "default" : typeof module[name] === "function" ? name : null;
-            if (!key) continue;
-            seen.add(module);
+        const renderer = find("findByProps", "renderChannelListItem", "getChannelListItemSize", "getFastListRecyclerKey");
+        if (!listStore?.getGuild || !renderer || !api.patcher?.instead) return;
+        const patches = [];
+        function hiddenRow(props) {
+            if (!active || loggedOut || !showInline) return;
             try {
-                disposers.push(api.patcher.after(key, module, (args, tree) => {
-                    if (!active || loggedOut || !showInline) return tree;
-                    const props = args[0] || {};
-                    const guildId = String(props.guildId || props.guild_id || props.guild?.id || currentGuild() || "");
-                    if (!guildId || !guilds().some(g => g.id === guildId)) return tree;
-                    try { return attachHiddenFooter(React, tree, ui.InlineSection, guildId).tree; }
-                    catch (_) { report("The server-list section is unavailable; use the settings viewer."); return tree; }
-                }));
-                hookNames.push(name);
+                const row = props?.guildChannels?.getChannelFromSectionRow?.(props.section, props.row)?.channel;
+                const channel = row?.record;
+                if (isHidden(channel)) return channel;
             } catch (_) {}
+        }
+        try {
+            // Install the safe renderer first, then expose the extra display rows.
+            patches.push(api.patcher.instead("renderChannelListItem", renderer, (args, original) => {
+                const channel = hiddenRow(args[0]);
+                if (!channel) return original(...args);
+                return React.createElement(ui.LockedRow, { guildId: String(channel.guild_id || channel.guildId), id: String(channel.id) });
+            }));
+            patches.push(api.patcher.instead("getChannelListItemSize", renderer, (args, original) => {
+                const channel = hiddenRow(args[0]);
+                if (!channel) return original(...args);
+                return hiddenVoiceLayout(voice(String(channel.guild_id || channel.guildId), String(channel.id)), args[0]?.fontScale).height;
+            }));
+            // Native categories retain their collapse behavior; only the displayed name gains a lock.
+            if (typeof renderer.renderChannelListSectionHeader === "function") {
+                patches.push(api.patcher.after("renderChannelListSectionHeader", renderer, (args, tree) => {
+                    if (!active || !showInline || !React.isValidElement(tree)) return tree;
+                    const channel = tree.props?.channel;
+                    if (!isHidden(channel) || Number(channel.type) !== 4) return tree;
+                    const display = Object.assign(Object.create(Object.getPrototypeOf(channel)), channel, { name: "🔒 " + (channel.name || "Name unavailable") });
+                    return React.cloneElement(tree, { channel: display });
+                }));
+            }
+            const project = (args, result) => {
+                if (!active || loggedOut || !showInline || !result?.guildChannels) return result;
+                const guildId = String(args[0] || ""), original = result.guildChannels;
+                if (original.__hiddenChannelsProjection || String(original.id) !== guildId) return result;
+                const cached = projections.get(guildId);
+                if (cached?.original === original && cached.version === result.guildChannelsVersion) return cached.result;
+                try {
+                    const data = snapshot(guildId);
+                    if (!data.hidden.length) return result;
+                    const projected = projectHiddenChannels(original, data.hidden, getChannel);
+                    if (!projected) { report("The channel-list model changed on this build. Use the settings viewer."); return result; }
+                    const next = { ...result, guildChannels: projected, guildChannelsVersion: (Number(result.guildChannelsVersion) || 0) + revision };
+                    projections.set(guildId, { original, version: result.guildChannelsVersion, result: next });
+                    return next;
+                } catch (_) { report("The channel-list layout is unsupported. Use the settings viewer."); return result; }
+            };
+            for (const key of ["getGuild", "getGuildWithoutChangingGuildActionRows"]) {
+                if (typeof listStore[key] === "function") patches.push(api.patcher.after(key, listStore, project));
+            }
+            disposers.push(...patches); inlineReady = true; hookNames.push("349.9 channel-list renderer");
+        } catch (_) {
+            for (const undo of patches.reverse()) { try { undo(); } catch (_) {} }
+            report("Could not attach the native channel-list adapter.");
         }
     }
     const runtime = {
-        snapshot, detail, showDetail, openViewer, closeModal,
+        snapshot, detail, showDetail, openViewer, closeModal, voice,
+        row(guildId, id) {
+            const channel = getChannel(id);
+            if (!isHidden(channel) || String(channel.guild_id || channel.guildId) !== String(guildId)) return null;
+            return { id, guildId, name: typeof channel.name === "string" && channel.name ? channel.name : "Name unavailable", type: Number(channel.type), voice: voice(guildId, id) };
+        },
         subscribe(fn) { subscribers.add(fn); return () => subscribers.delete(fn); },
         inlineEnabled: () => active && showInline,
-        setInline(value) { showInline = !!value; storage.showInline = showInline; notify(); },
-        markInlineMounted() { if (!inlineMounted) { inlineMounted = true; notify(); } },
+        setInline(value) { showInline = !!value; storage.showInline = showInline; notify(); refreshList(); },
+        markInlineMounted() { inlineMounted = true; },
         status() {
-            return "Server-list section: " + (!showInline ? "off" : inlineMounted ? "displayed" : hookNames.length ? "hook found; waiting for a supported list layout" : "unavailable on this build; use the viewer below")
+            return "Channels in normal categories: " + (!showInline ? "off" : inlineMounted ? "displayed" : inlineReady ? "adapter ready; reopen a server" : "unavailable on this build; use the viewer below")
                 + "." + (lastIssue ? " " + lastIssue : "");
         }
     };
@@ -354,22 +516,27 @@ function createHiddenPlugin(api) {
         userStore = store("UserStore", "getCurrentUser");
         selectedGuildStore = store("SelectedGuildStore", "getGuildId");
         permissionStore = store("PermissionStore", "getChannelPermissions", "can");
+        voiceStore = find("findByStoreName", "VoiceStateStore") || find("findByProps", "getVoiceStatesForChannel", "getVoiceStateForUser");
+        memberStore = store("GuildMemberStore", "getMember", "getMembers");
+        listStore = find("findByStoreName", "ChannelListStore") || find("findByProps", "getGuild", "getGuildWithoutChangingGuildActionRows");
         permissionCheck = permissionStore?.can;
         viewPermission = common.constants?.Permissions?.VIEW_CHANNEL ?? find("findByProps", "Permissions")?.Permissions?.VIEW_CHANNEL;
-        active = true; loggedOut = false; inlineMounted = false; hookNames = []; lastIssue = "";
-        for (const source of new Set([channelStore, guildStore, permissionStore, userStore, selectedGuildStore])) {
+        active = true; loggedOut = false; inlineMounted = false; inlineReady = false; hookNames = []; lastIssue = "";
+        for (const source of new Set([channelStore, guildStore, permissionStore, userStore, selectedGuildStore, voiceStore, memberStore])) {
             if (!source?.addChangeListener || !source?.removeChangeListener) continue;
-            try { source.addChangeListener(notify); disposers.push(() => source.removeChangeListener(notify)); } catch (_) {}
+            const change = () => { notify(); refreshList(); };
+            try { source.addChangeListener(change); disposers.push(() => source.removeChangeListener(change)); } catch (_) {}
         }
         const dispatcher = common.FluxDispatcher;
         if (dispatcher?.subscribe && dispatcher?.unsubscribe) {
-            const logout = () => { loggedOut = true; closeModal(); notify(); };
-            const login = () => { loggedOut = false; notify(); };
+            const logout = () => { loggedOut = true; closeModal(); notify(); refreshList(); };
+            const login = () => { loggedOut = false; notify(); refreshList(); };
             for (const [event, callback] of [["LOGOUT", logout], ["CONNECTION_OPEN", login]]) {
                 dispatcher.subscribe(event, callback); disposers.push(() => dispatcher.unsubscribe(event, callback));
             }
         }
         installInline();
+        refreshList();
         if (api.commands?.registerCommand) {
             try {
                 disposers.push(api.commands.registerCommand({ name: "hidden", description: "Browse cached hidden-channel names and details", options: [],
@@ -384,8 +551,10 @@ function createHiddenPlugin(api) {
     }
     function onUnload() {
         active = false; closeModal(); notify();
+        if (refreshTimer != null) { clearTimeout(refreshTimer); refreshTimer = undefined; }
         for (const dispose of disposers.splice(0).reverse()) { try { dispose(); } catch (_) {} }
-        hookNames = []; inlineMounted = false;
+        hookNames = []; inlineMounted = false; inlineReady = false;
+        try { listStore?.emitChange?.(); } catch (_) {}
     }
     return { onLoad, onUnload, settings: ui.Settings };
 }

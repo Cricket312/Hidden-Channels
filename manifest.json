@@ -1,15 +1,15 @@
 {
   "name": "Hidden Channels",
-  "description": "Classic beta: browse cached hidden-channel names, topics and categories. No message access or remote logging.",
+  "description": "Named locked channels in normal categories, with cached voice participants. Classic 349.9 beta.",
   "authors": [
     {
       "name": "Custom build"
     }
   ],
   "main": "index.js",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "vendetta": {
     "icon": "ic_lock"
   },
-  "hash": "65d22bb12fc4a6b55aab47ae74b96459f83db8d077f422c7c1adf70eae8737fd"
+  "hash": "a1949705a6776f6e9cd79c5c883de6861030ddb6a6bbdfb70217d13435633ef7"
 }
