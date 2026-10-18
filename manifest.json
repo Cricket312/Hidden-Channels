@@ -1,0 +1,15 @@
+{
+  "name": "Hidden Channels",
+  "description": "Classic beta: browse cached hidden-channel names, topics and categories. No message access or remote logging.",
+  "authors": [
+    {
+      "name": "Custom build"
+    }
+  ],
+  "main": "index.js",
+  "version": "0.1.0",
+  "vendetta": {
+    "icon": "ic_lock"
+  },
+  "hash": "65d22bb12fc4a6b55aab47ae74b96459f83db8d077f422c7c1adf70eae8737fd"
+}
