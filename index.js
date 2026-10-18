@@ -38,7 +38,8 @@ function hiddenChannelModel() {
             const parent = byId.get(parentId);
             hidden.push({
                 id: String(channel.id), guildId: String(guildId), type: Number(channel.type),
-                typeName: types[channel.type], name: text(channel.name) || "Name unavailable",
+                typeName: types[channel.type], name: channel.name === "__hidden__" ? "Name unavailable" : text(channel.name) || "Name unavailable",
+                nameObfuscated: channel.name === "__hidden__",
                 topic: text(channel.topic, 6000), parentId,
                 category: Number(channel.type) === 4 ? "Categories" : (parent ? text(parent.name) : (parentId ? "Category " + parentId : "Uncategorized")),
                 categoryPosition: Number(channel.type) === 4 ? -2 : (parent ? position(parent.position) : -1),
@@ -176,6 +177,45 @@ function hiddenVoiceLayout(voice, fontScale = 1) {
 }
 
 
+/* Compatibility with Android 349.9's private-channel-hiding experiment.
+ * These are metadata experiment helpers, not channel permissions or auth APIs.
+ * Changes take effect on Discord's next normal gateway identification.
+ */
+function installChannelNameCompatibility(api, enabled) {
+    const patches = [], touched = new Set();
+    const find = (method, ...args) => { try { return api.metro[method]?.(...args); } catch (_) {} };
+    const experiment = find("findByProps", "isChannelMetadataObfuscationEnabled", "isChannelMetadataIntegrityCheckEnabled");
+    const capabilities = find("findByProps", "getClientCapabilities");
+    const caches = find("findByPropsAll", "getCachedPrivateChannelObfuscation", "PRIVATE_CHANNEL_OBFUSCATION_KEY") || [];
+    const cache = find("findByProps", "getCachedPrivateChannelObfuscation", "PRIVATE_CHANNEL_OBFUSCATION_KEY");
+    function patchFlag(target, key) {
+        if (!target || typeof target[key] !== "function") return;
+        let keys = touched.has(target) ? targetKeys.get(target) : null;
+        if (!keys) { keys = new Set(); targetKeys.set(target, keys); touched.add(target); }
+        if (keys.has(key)) return;
+        // Run the original even for the React hook so hook order/subscriptions remain valid.
+        patches.push(api.patcher.after(key, target, (_args, result) => enabled() ? false : result));
+        keys.add(key);
+    }
+    const targetKeys = new Map();
+    try {
+        if (!experiment || typeof capabilities?.getClientCapabilities !== "function") return { ready: false, dispose() {} };
+        for (const key of ["isChannelMetadataObfuscationEnabled", "isChannelMetadataIntegrityCheckEnabled", "useIsChannelMetadataObfuscationEnabled"]) patchFlag(experiment, key);
+        for (const target of new Set([experiment, cache, ...(Array.isArray(caches) ? caches : [])])) patchFlag(target, "getCachedPrivateChannelObfuscation");
+        patches.push(api.patcher.instead("getClientCapabilities", capabilities, (args, original) => {
+            if (!enabled() || !args[0] || typeof args[0] !== "object") return original(...args);
+            // Pass the normal capability calculator its documented metadata option.
+            // Do not edit raw gateway payloads, sessions, credentials or other capability bits.
+            return original({ ...args[0], useChannelObfuscation: false }, ...args.slice(1));
+        }));
+        return { ready: true, dispose() { for (const undo of patches.splice(0).reverse()) { try { undo(); } catch (_) {} } } };
+    } catch (_) {
+        for (const undo of patches.reverse()) { try { undo(); } catch (_) {} }
+        return { ready: false, dispose() {} };
+    }
+}
+
+
 function createHiddenUI(api, runtime) {
     const React = api.metro.common.React, RN = api.metro.common.ReactNative, h = React.createElement;
     const c = { bg: "#17181f", card: "#242630", text: "#f2f3f5", muted: "#b4b7c5", accent: "#b3baff", line: "#3b3e4d" };
@@ -252,11 +292,15 @@ function createHiddenUI(api, runtime) {
             text("Hidden channels", s.title),
             text("Names and details already received by your Discord client. Hidden messages cannot be read.", s.muted),
             showSettings ? h(RN.View, { style: s.card },
-                text("Version " + (api.plugin.manifest?.version || "0.2.0") + " · Classic beta", s.muted),
+                text("Version " + (api.plugin.manifest?.version || "0.2.1") + " · Classic beta", s.muted),
                 h(RN.View, { style: s.row }, h(RN.View, { style: { flex: 1, paddingRight: 10 } },
                     text("Show hidden channels in normal categories"), text("Real names with a lock; voice participants when available.", s.muted)),
                     h(RN.Switch, { value: runtime.inlineEnabled(), onValueChange: runtime.setInline, accessibilityLabel: "Show hidden channels in normal categories" })),
-                text(runtime.status(), s.muted)) : null,
+                text(runtime.status(), s.muted),
+                h(RN.View, { style: s.row }, h(RN.View, { style: { flex: 1, paddingRight: 10 } },
+                    text("Use unmasked channel names"), text("Compatibility for Discord's name-hiding experiment. Requires a restart.", s.muted)),
+                    h(RN.Switch, { value: runtime.namesEnabled(), onValueChange: runtime.setNames, accessibilityLabel: "Use unmasked channel names" })),
+                text(runtime.nameStatus(), s.muted)) : null,
             button(data.guild ? data.guild.name + " · Change server" : "Choose a server", () => { setChoosing(!choosing); setSelected(""); }),
             choosing ? h(RN.View, null,
                 data.guilds.length ? data.guilds.map(g => h(RN.TouchableOpacity, { key: g.id, style: s.button, onPress: () => choose(g.id), accessibilityRole: "button" }, text(g.name)))
@@ -316,6 +360,7 @@ function createHiddenPlugin(api) {
     let permissionCheck, viewPermission, ui, modalOpen = false, inlineMounted = false;
     let hookNames = [], lastIssue = "", reading = false;
     let showInline = storage.showInline !== false;
+    let restoreNames = storage.restoreNames !== false, namesReady = false;
     let revision = 0, refreshTimer, inlineReady = false;
     const projections = new Map();
     function find(method, ...args) { try { return api.metro[method]?.(...args); } catch (_) {} }
@@ -391,6 +436,9 @@ function createHiddenPlugin(api) {
             Object.assign(result, model.catalog(raw.sources, guild.id, channel => permissionCheck.call(permissionStore, viewPermission, channel)));
             if (!result.cached) result.issue = "No channel metadata is cached for this server yet. Open its channel list, then refresh.";
             else if (result.unknown) result.issue = result.unknown + " cached channel(s) could not be classified by the permission reader.";
+            const masked = result.hidden.filter(c => c.nameObfuscated).length;
+            if (masked) result.issue += (result.issue ? " " : "") + masked + " channel name(s) are still masked in Discord's received data. "
+                + (namesReady && restoreNames ? "Fully close and reopen Discord with this plugin enabled to try a fresh connection." : "Enable the name compatibility option if available on this build.");
             return result;
         } catch (_) { result.issue = "Could not read this server's cached channel metadata."; return result; }
         finally { reading = false; }
@@ -497,10 +545,13 @@ function createHiddenPlugin(api) {
         row(guildId, id) {
             const channel = getChannel(id);
             if (!isHidden(channel) || String(channel.guild_id || channel.guildId) !== String(guildId)) return null;
-            return { id, guildId, name: typeof channel.name === "string" && channel.name ? channel.name : "Name unavailable", type: Number(channel.type), voice: voice(guildId, id) };
+            return { id, guildId, name: typeof channel.name === "string" && channel.name && channel.name !== "__hidden__" ? channel.name : "Name unavailable", type: Number(channel.type), voice: voice(guildId, id) };
         },
         subscribe(fn) { subscribers.add(fn); return () => subscribers.delete(fn); },
         inlineEnabled: () => active && showInline,
+        namesEnabled: () => restoreNames,
+        setNames(value) { restoreNames = !!value; storage.restoreNames = restoreNames; notify(); },
+        nameStatus() { return !restoreNames ? "Name compatibility is off." : namesReady ? "Name compatibility is active. Fully restart Discord after installing or changing this option. Already masked names need a fresh connection." : "The name compatibility API is unavailable on this build."; },
         setInline(value) { showInline = !!value; storage.showInline = showInline; notify(); refreshList(); },
         markInlineMounted() { inlineMounted = true; },
         status() {
@@ -522,6 +573,9 @@ function createHiddenPlugin(api) {
         permissionCheck = permissionStore?.can;
         viewPermission = common.constants?.Permissions?.VIEW_CHANNEL ?? find("findByProps", "Permissions")?.Permissions?.VIEW_CHANNEL;
         active = true; loggedOut = false; inlineMounted = false; inlineReady = false; hookNames = []; lastIssue = "";
+        const nameCompatibility = installChannelNameCompatibility(api, () => active && restoreNames);
+        namesReady = nameCompatibility.ready;
+        disposers.push(nameCompatibility.dispose);
         for (const source of new Set([channelStore, guildStore, permissionStore, userStore, selectedGuildStore, voiceStore, memberStore])) {
             if (!source?.addChangeListener || !source?.removeChangeListener) continue;
             const change = () => { notify(); refreshList(); };
@@ -553,7 +607,7 @@ function createHiddenPlugin(api) {
         active = false; closeModal(); notify();
         if (refreshTimer != null) { clearTimeout(refreshTimer); refreshTimer = undefined; }
         for (const dispose of disposers.splice(0).reverse()) { try { dispose(); } catch (_) {} }
-        hookNames = []; inlineMounted = false; inlineReady = false;
+        hookNames = []; inlineMounted = false; inlineReady = false; namesReady = false;
         try { listStore?.emitChange?.(); } catch (_) {}
     }
     return { onLoad, onUnload, settings: ui.Settings };

@@ -7,9 +7,9 @@
     }
   ],
   "main": "index.js",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "vendetta": {
     "icon": "ic_lock"
   },
-  "hash": "a1949705a6776f6e9cd79c5c883de6861030ddb6a6bbdfb70217d13435633ef7"
+  "hash": "b301a20479c1aea67cbb015341930fbc3e1bf908463537e74bee5cb26161ddca"
 }
